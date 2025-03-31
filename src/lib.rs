@@ -6,15 +6,15 @@ extern crate proc_macro_error;
 use proc_macro2::{Ident, Span};
 use quote::quote;
 use std::path::PathBuf;
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, parse_quote, AttributeArgs, FnArg, GenericArgument, Item, ItemFn,
-    ItemStruct, Lit, NestedMeta, PatType, Path, PathArguments, ReturnType, Token, TraitBound, Type,
-    TypeParamBound, TypePath, TypeTuple,
+    parse_macro_input, parse_quote, FnArg, GenericArgument, Item, ItemFn, ItemStruct, Lifetime,
+    Lit, PatType, Path, PathArguments, ReturnType, Token, Type, TypePath, TypeTuple,
 };
 
-fn get_return_iterator_item(function: &ItemFn) -> Option<&Ident> {
+fn get_return_iterator_item_and_lt(function: &ItemFn) -> Option<(&Ident, &Lifetime)> {
     let ret = match &function.sig.output {
         ReturnType::Type(_, typ) => typ.as_ref(),
         ReturnType::Default => {
@@ -28,65 +28,83 @@ fn get_return_iterator_item(function: &ItemFn) -> Option<&Ident> {
     };
 
     let bound = match ret {
-        Type::ImplTrait(impl_trait) => impl_trait.bounds.first().unwrap(),
+        Type::Path(impl_trait)
+            if impl_trait
+                .path
+                .segments
+                .last()
+                .is_some_and(|l| l.ident == "TableIterator") =>
+        {
+            impl_trait
+        }
         ty => {
             emit_error!(
-                ty, "return value must be an impl Iterator";
-                help = "change this type to `impl Iterator<Item = YourRowStruct>`";
+                ty, "return value must be a TableIterator";
+                help = "change this type to `::pgrx::iter::TableIterator<'_, YourRowStruct>`";
             );
             return None;
         }
     };
 
-    let iterator_item = match bound {
-        TypeParamBound::Trait(TraitBound {
-            path: Path { segments, .. },
-            ..
-        }) if segments.len() == 1 => {
-            let first = segments.first().unwrap();
-            if first.ident != "Iterator" {
-                emit_error!(first.ident, "should be `Iterator`");
+    match bound {
+        TypePath {
+            qself: None,
+            path: Path {
+                leading_colon,
+                segments,
+            },
+        } => {
+            if leading_colon.is_none()
+                || segments.len() != 3
+                || segments[0].ident != "pgrx"
+                || (segments[1].ident != "iter" && segments[1].ident != "prelude")
+            {
+                emit_error!(
+                    bound, "the path to TableIterator must be fully qualified";
+                    help = "replace with `::pgrx::iter::TableIterator`";
+                );
                 return None;
             }
 
-            match &first.arguments {
-                PathArguments::AngleBracketed(ab) => ab
-                    .args
-                    .iter()
-                    .filter_map(|arg| match arg {
-                        GenericArgument::Binding(binding) if binding.ident == "Item" => {
-                            Some(&binding.ty)
+            let last = bound.path.segments.last().unwrap();
+            match &last.arguments {
+                PathArguments::AngleBracketed(ab) => {
+                    if ab.args.len() != 2 {
+                        abort!(ab.args, "expected 2 generic args: a lifetime and a type");
+                    }
+
+                    let GenericArgument::Lifetime(lt) = &ab.args[0] else {
+                        abort!(&ab.args[0], "first argument must be a lifetime");
+                    };
+
+                    let GenericArgument::Type(binding) = &ab.args[1] else {
+                        abort!(&ab.args[1], "second argument must be a type");
+                    };
+
+                    let binding_name = match binding {
+                        Type::Path(TypePath { path, .. }) if path.segments.len() == 1 => {
+                            &path.segments[0].ident
                         }
-                        _ => None,
-                    })
-                    .next()
-                    .expect("no associated type Item on Iterator"),
-                _ => abort!(&first.arguments, "the Iterator has no associated types"),
+                        Type::Path(_) => {
+                            emit_error!(binding, "expected an identifier (path given)");
+                            return None;
+                        }
+                        _ => {
+                            emit_error!(binding, "expected an identifier");
+                            return None;
+                        }
+                    };
+
+                    Some((binding_name, lt))
+                }
+                _ => abort!(
+                    &last.arguments,
+                    "the Iterator has no generic type parameter"
+                ),
             }
         }
-        TypeParamBound::Lifetime(_) => unreachable!(),
-        TypeParamBound::Trait(TraitBound {
-            path: Path { segments, .. },
-            ..
-        }) => abort!(
-            segments,
-            "this trait should be exactly `Iterator` (with no path components before)"
-        ),
-    };
-
-    let iterator_item = match iterator_item {
-        Type::Path(TypePath { path, .. }) if path.segments.len() == 1 => &path.segments[0].ident,
-        Type::Path(_) => {
-            emit_error!(iterator_item, "expected an identifier (path given)");
-            return None;
-        }
-        _ => {
-            emit_error!(iterator_item, "expected an identifier");
-            return None;
-        }
-    };
-
-    Some(iterator_item)
+        _ => unreachable!(),
+    }
 }
 
 #[cfg(not(doctest))]
@@ -114,14 +132,10 @@ fn read_struct(source_path_span: Span, iterator_item: &Ident, source_path: &Path
     };
 
     let source = syn::parse_file(&source_contents).unwrap();
-    let struct_def = source
-        .items
-        .into_iter()
-        .filter_map(|item| match item {
-            Item::Struct(struct_item) if &struct_item.ident == iterator_item => Some(struct_item),
-            _ => None,
-        })
-        .next();
+    let struct_def = source.items.into_iter().find_map(|item| match item {
+        Item::Struct(struct_item) if &struct_item.ident == iterator_item => Some(struct_item),
+        _ => None,
+    });
 
     match struct_def {
         Some(struct_def) => struct_def,
@@ -141,7 +155,7 @@ fn struct_to_tuple(s: ItemStruct) -> TypeTuple {
         let name = &field.ident;
         let ty = &field.ty;
 
-        quote! { ::pgx::name!(#name, #ty) }
+        quote! { ::pgrx::name!(#name, #ty) }
     });
 
     parse_quote! {
@@ -151,15 +165,22 @@ fn struct_to_tuple(s: ItemStruct) -> TypeTuple {
     }
 }
 
-/// Defines a [`#[pg_extern]`][::pgx::pg_extern] function, but with its columns specified as the
-/// fields of a structure
+struct MetaList(Punctuated<Lit, Token![,]>);
+
+impl Parse for MetaList {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Punctuated::parse_terminated(input).map(Self)
+    }
+}
+
+/// Defines a `#[pg_extern]` function, but with its columns specified as the fields of a structure
 ///
 /// ## Conditions
 ///
 /// This proc-macro _may only_ be applied to a top-level function item whose return type is
-/// `-> impl Iterator<Item = T>`, where `T` is a top-level structure in the same file as the
-/// function item. The trait [`Iterator`] above _must_ be written exactly as-is, with no leading
-/// module path (« `impl std::iter::Iterator<Item = T>` » will not work). The macro `#[pg_extern]`
+/// `-> ::pgrx::iter::TableIterator<'_, T>`, where `T` is a top-level structure in the same file as
+/// the function item. The type `TableIterator` above _must_ be written exactly as-is, with a
+/// fully-qualified path ("`TableIterator<Item = T>`" will not work). The macro `#[pg_extern]`
 /// _may not_ be applied to an item where `#[pg_extern_columns]`, as the latter will automatically
 /// add the former where it should.
 ///
@@ -176,13 +197,13 @@ fn struct_to_tuple(s: ItemStruct) -> TypeTuple {
 ///
 /// Currently, passing arguments to the automatically-emitted `#[pg_extern]` _is not_ supported.
 ///
-/// [proc_macro_span](https://doc.rust-lang.org/proc_macro/struct.Span.html#method.source_file)
+/// [proc_macro_span]: https://doc.rust-lang.org/proc_macro/struct.Span.html#method.source_file
 ///
 /// ## Example
 ///
-/// ```rust
-/// # use pgx::*;
-/// # use pgx_named_columns::*;
+/// ```
+/// # use pgrx::*;
+/// # use pgrx_named_columns::*;
 /// #
 /// const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 ///
@@ -192,7 +213,7 @@ fn struct_to_tuple(s: ItemStruct) -> TypeTuple {
 /// }
 ///
 /// #[pg_extern_columns("path/to/current/file.rs")]
-/// fn alphabet(length: i8) -> impl Iterator<Item = IndexedLetter> {
+/// fn alphabet(length: i8) -> ::pgrx::iter::TableIterator<'static, IndexedLetter> {
 ///     panic!("{}", file!());
 ///     ALPHABET
 ///         .chars()
@@ -210,7 +231,7 @@ pub fn pg_extern_columns(
     attr: proc_macro::TokenStream,
     input: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let source_path = match parse_macro_input!(attr as AttributeArgs) {
+    let source_path = match parse_macro_input!(attr as MetaList).0 {
         attr if attr.is_empty() => {
             emit_error!(
                 Span::call_site(), "missing path";
@@ -219,7 +240,7 @@ pub fn pg_extern_columns(
             None
         }
         attr if attr.len() == 1 => match &attr[0] {
-            nm @ NestedMeta::Lit(Lit::Str(str)) => Some((PathBuf::from(str.value()), nm.span())),
+            nm @ Lit::Str(str) => Some((PathBuf::from(str.value()), nm.span())),
             attr => {
                 emit_error!(attr, "only argument should be a string literal");
                 None
@@ -231,13 +252,13 @@ pub fn pg_extern_columns(
         }
     };
 
-    let function = parse_macro_input!(input as ItemFn);
-    let iterator_item = get_return_iterator_item(&function);
+    let mut function = parse_macro_input!(input as ItemFn);
+    let iterator_item = get_return_iterator_item_and_lt(&function);
 
     if let Some(attr) = function
         .attrs
         .iter()
-        .find(|attr| attr.path.segments.last().unwrap().ident == "pg_extern")
+        .find(|attr| attr.path().segments.last().unwrap().ident == "pg_extern")
     {
         emit_error!(attr, "#[pg_extern] shouldn't be applied to this function, #[pg_extern_columns] applies it automatically");
     }
@@ -247,7 +268,7 @@ pub fn pg_extern_columns(
     // FIXME: when source_file() is stable
     //  let source_path = iterator_item.span().source_file().path();
     let (source_path, source_path_span) = source_path.unwrap();
-    let iterator_item = iterator_item.unwrap();
+    let (iterator_item, lt) = iterator_item.unwrap();
 
     let struct_def = read_struct(source_path_span, iterator_item, &source_path);
 
@@ -281,7 +302,7 @@ pub fn pg_extern_columns(
             }
         })
         .enumerate()
-        .map(|(i, arg)| (Ident::new(&format!("arg{}", i), arg.span()), arg))
+        .map(|(i, arg)| (Ident::new(&format!("arg{i}"), arg.span()), arg))
         .collect::<Vec<_>>();
 
     let calling_args = args
@@ -295,11 +316,15 @@ pub fn pg_extern_columns(
         .collect::<Punctuated<FnArg, Token![,]>>();
 
     function_sig.output = parse_quote! {
-        -> impl std::iter::Iterator<Item = #tuple>
+        -> ::pgrx::iter::TableIterator<#lt, #tuple>
+    };
+
+    function.sig.output = parse_quote! {
+        -> impl ::core::iter::Iterator<Item = #iterator_item> + #lt
     };
 
     let wrapping_module_name = Ident::new(
-        &format!("__pgx_named_columns_wrapper_{}", function_name),
+        &format!("__pgrx_named_columns_wrapper_{function_name}"),
         function_name.span(),
     );
 
@@ -310,7 +335,7 @@ pub fn pg_extern_columns(
             #![allow(deprecated)]
 
             use super::*;
-            use pgx::*;
+            use pgrx::*;
 
             type Tuple = #tuple;
 
@@ -327,7 +352,7 @@ pub fn pg_extern_columns(
 
             #[pg_extern]
             #function_sig {
-                super::#function_name(#calling_args).map(IntoTuple::into_tuple)
+                ::pgrx::iter::TableIterator::new(super::#function_name(#calling_args).map(IntoTuple::into_tuple))
             }
         }
     };

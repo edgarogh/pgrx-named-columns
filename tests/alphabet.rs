@@ -1,5 +1,5 @@
-use pgx::*;
-use pgx_named_columns::*;
+use pgrx::*;
+use pgrx_named_columns::*;
 
 const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -9,7 +9,7 @@ pub struct IndexedLetter {
 }
 
 #[pg_extern_columns("tests/alphabet.rs")]
-fn alphabet(length: i8) -> impl Iterator<Item = IndexedLetter> {
+fn alphabet(length: i8) -> ::pgrx::iter::TableIterator<'static, IndexedLetter> {
     ALPHABET
         .chars()
         .take(length.clamp(0, 25) as usize)
